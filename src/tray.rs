@@ -6,14 +6,16 @@ use windows_sys::Win32::Graphics::Gdi::{
     DIB_RGB_COLORS,
 };
 use windows_sys::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
-    NOTIFYICONDATAW,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, HICON, ICONINFO, WM_APP};
 
 use crate::util::copy_wide;
 
 pub const WM_TRAY: u32 = WM_APP + 1;
+/// Posted by a second launch so the running instance opens its menu.
+pub const WM_SHOW_MENU: u32 = WM_APP + 2;
 const ICON_ID: u32 = 1;
 
 fn data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -37,6 +39,15 @@ pub fn set_tip(hwnd: HWND, tip: &str) {
     let mut nid = data(hwnd);
     nid.uFlags = NIF_TIP;
     copy_wide(&mut nid.szTip, tip);
+    unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
+}
+
+pub fn balloon(hwnd: HWND, title: &str, text: &str) {
+    let mut nid = data(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.dwInfoFlags = NIIF_INFO;
+    copy_wide(&mut nid.szInfoTitle, title);
+    copy_wide(&mut nid.szInfo, text);
     unsafe { Shell_NotifyIconW(NIM_MODIFY, &nid) };
 }
 

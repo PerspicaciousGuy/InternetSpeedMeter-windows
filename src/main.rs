@@ -23,7 +23,7 @@ use windows_sys::Win32::UI::HiDpi::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use net::Sampler;
-use overlay::Overlay;
+use overlay::{Line, Overlay};
 use settings::{Color, Settings, Show, Size, Units};
 use usage::Usage;
 use util::{fmt_bytes, fmt_speed, today_key, wide};
@@ -108,8 +108,8 @@ impl App {
 
     fn refresh_overlay(&mut self) {
         let units = self.settings.units;
-        let down = format!("\u{2193} {}", fmt_speed(self.down_bps, units));
-        let up = format!("\u{2191} {}", fmt_speed(self.up_bps, units));
+        let down = Line { down: true, value: fmt_speed(self.down_bps, units) };
+        let up = Line { down: false, value: fmt_speed(self.up_bps, units) };
         let lines = match self.settings.show {
             Show::Both => vec![down, up],
             Show::Down => vec![down],
@@ -156,7 +156,17 @@ fn main() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
         let mutex = CreateMutexW(ptr::null(), 0, w!("Local\\InternetSpeedMeter.SingleInstance"));
-        if mutex.is_null() || GetLastError() == ERROR_ALREADY_EXISTS {
+        let already_running = GetLastError() == ERROR_ALREADY_EXISTS;
+        if mutex.is_null() {
+            return;
+        }
+        if already_running {
+            // Launching the app again (e.g. from the Start menu) opens the running copy's menu.
+            let other = FindWindowW(w!("InternetSpeedMeterOverlay"), ptr::null());
+            if !other.is_null() {
+                AllowSetForegroundWindow(u32::MAX); // ASFW_ANY
+                PostMessageW(other, tray::WM_SHOW_MENU, 0, 0);
+            }
             return;
         }
 
@@ -199,7 +209,11 @@ fn main() {
             return;
         }
 
+        let first_run = Settings::is_first_run();
         let settings = Settings::load();
+        if first_run {
+            settings.save();
+        }
         let icon = tray::make_icon();
         let mut app = App {
             hwnd,
@@ -217,6 +231,13 @@ fn main() {
         };
         app.sampler.tick(None); // baseline so the first real tick has a delta
         tray::add(hwnd, icon, &app.tooltip());
+        if first_run {
+            tray::balloon(
+                hwnd,
+                "Internet Speed Meter is running",
+                "Right-click its tray icon (under the ^ arrow if hidden) for settings and data usage.",
+            );
+        }
         SetTimer(hwnd, TIMER_ID, app.settings.interval_secs * 1000, None);
         app.refresh_overlay();
         APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -238,8 +259,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         tray::WM_TRAY => {
             let event = lp as u32;
             if event == WM_RBUTTONUP || event == WM_LBUTTONUP {
-                show_menu(hwnd);
+                show_menu(hwnd, None);
             }
+            0
+        }
+        tray::WM_SHOW_MENU => {
+            let anchor = with_app(|a| a.overlay.anchor()).flatten();
+            show_menu(hwnd, anchor.map(|(x, y)| POINT { x, y }));
             0
         }
         WM_SETTINGCHANGE | WM_DISPLAYCHANGE | WM_DPICHANGED => {
@@ -286,7 +312,8 @@ unsafe fn add_submenu(menu: HMENU, text: &str, sub: HMENU) {
     AppendMenuW(menu, MF_POPUP | MF_STRING, sub as usize, t.as_ptr());
 }
 
-unsafe fn show_menu(hwnd: HWND) {
+/// Opens the settings menu at `anchor`, or at the cursor when there is none.
+unsafe fn show_menu(hwnd: HWND, anchor: Option<POINT>) {
     let Some((s, adapters, today, month)) = with_app(|a| {
         let day = today_key();
         (
@@ -361,8 +388,10 @@ unsafe fn show_menu(hwnd: HWND) {
     AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
     add_item(menu, ID_EXIT, "Exit", false);
 
-    let mut pt = POINT { x: 0, y: 0 };
-    GetCursorPos(&mut pt);
+    let mut pt = anchor.unwrap_or(POINT { x: 0, y: 0 });
+    if anchor.is_none() {
+        GetCursorPos(&mut pt);
+    }
     // Required so the menu closes when the user clicks elsewhere.
     SetForegroundWindow(hwnd);
     let cmd = TrackPopupMenu(

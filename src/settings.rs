@@ -67,6 +67,10 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn is_first_run() -> bool {
+        !data_dir().join("settings.ini").exists()
+    }
+
     pub fn load() -> Self {
         let mut s = Settings::default();
         let Ok(text) = fs::read_to_string(data_dir().join("settings.ini")) else {

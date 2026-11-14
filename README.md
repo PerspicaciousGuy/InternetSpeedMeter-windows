@@ -22,7 +22,11 @@ one small exe that idles at ~0% CPU.
 
 ## Settings
 
-Right-click the tray icon: units (MB/s or Mbps), show download / upload / both, update
+**Opening settings:** right-click (or left-click) the meter's tray icon. Windows 11 often
+hides new tray icons under the `^` arrow; drag it onto the taskbar to keep it visible.
+Launching *Internet Speed Meter* again from the Start menu also opens the menu.
+
+The menu has: units (MB/s or Mbps), show download / upload / both, update
 interval, text size, text color (auto follows the Windows theme), which network adapter to
 watch, position nudge, start with Windows. Settings live in
 `%APPDATA%\InternetSpeedMeter\settings.ini`.

@@ -6,7 +6,7 @@ use windows_sys::Win32::Foundation::{HWND, POINT, RECT, SIZE};
 use windows_sys::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, CreateFontW, DeleteDC, DeleteObject, DrawTextW, GdiFlush,
     GetDC, GetTextExtentPoint32W, ReleaseDC, SelectObject, SetBkMode, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX,
+    BITMAPINFOHEADER, BLENDFUNCTION, DIB_RGB_COLORS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_RIGHT,
     DT_SINGLELINE, HFONT,
 };
 use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
@@ -23,10 +23,53 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::settings::{Color, Settings, Units};
 use crate::util::wide;
 
-/// Font and measured text size for the current size/DPI/unit combination.
+type Rgb = (u8, u8, u8);
+
+const PAD: i32 = 2;
+const WHITE: Rgb = (255, 255, 255);
+const DARK: Rgb = (24, 24, 24);
+
+/// One row of the meter: a direction arrow and its formatted speed.
+#[derive(Clone, PartialEq)]
+pub struct Line {
+    pub down: bool,
+    pub value: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct Palette {
+    text: Rgb,
+    down: Rgb,
+    up: Rgb,
+}
+
+impl Palette {
+    fn new(color: Color, light_theme: bool) -> Palette {
+        let mono = |c: Rgb| Palette { text: c, down: c, up: c };
+        match color {
+            Color::White => mono(WHITE),
+            Color::Black => mono(DARK),
+            // Colored arrows, in darker shades on a light taskbar for contrast.
+            Color::Auto if light_theme => Palette {
+                text: DARK,
+                down: (16, 124, 84),
+                up: (190, 96, 0),
+            },
+            Color::Auto => Palette {
+                text: WHITE,
+                down: (72, 200, 140),
+                up: (255, 176, 80),
+            },
+        }
+    }
+}
+
+/// Font and measured text sizes for the current size/DPI/unit combination.
 struct Layout {
     key: (i32, u32, bool),
     font: HFONT,
+    arrow_w: i32,
+    gap: i32,
     width: i32,
     line_h: i32,
 }
@@ -39,7 +82,7 @@ impl Layout {
                 0,
                 0,
                 0,
-                400,
+                600, // semibold reads better on a busy taskbar
                 0,
                 0,
                 0,
@@ -52,16 +95,25 @@ impl Layout {
             );
             let dc = CreateCompatibleDC(ptr::null_mut());
             let old = SelectObject(dc, font);
-            let template = wide(if bits { "\u{2193} 999.9 Mbps" } else { "\u{2193} 999.9 MB/s" });
-            let mut size = SIZE { cx: 0, cy: 0 };
-            GetTextExtentPoint32W(dc, template.as_ptr(), (template.len() - 1) as i32, &mut size);
+            let measure = |s: &str| {
+                let t = wide(s);
+                let mut size = SIZE { cx: 0, cy: 0 };
+                GetTextExtentPoint32W(dc, t.as_ptr(), (t.len() - 1) as i32, &mut size);
+                size
+            };
+            let arrow = measure("\u{2193}");
+            let value = measure(if bits { "999.9 Mbps" } else { "999.9 MB/s" });
             SelectObject(dc, old);
             DeleteDC(dc);
+
+            let gap = (dpi as i32 * 5 / 96).max(3);
             Layout {
                 key: (points, dpi, bits),
                 font,
-                width: size.cx + 4,
-                line_h: size.cy,
+                arrow_w: arrow.cx,
+                gap,
+                width: PAD * 2 + arrow.cx + gap + value.cx,
+                line_h: arrow.cy.max(value.cy),
             }
         }
     }
@@ -78,9 +130,9 @@ pub struct Overlay {
     hwnd: HWND,
     layout: Option<Layout>,
     visible: bool,
-    last_lines: Vec<String>,
+    last_lines: Vec<Line>,
     last_pos: (i32, i32),
-    last_rgb: (u8, u8, u8),
+    last_palette: Option<Palette>,
     light_theme: bool,
 }
 
@@ -92,7 +144,7 @@ impl Overlay {
             visible: false,
             last_lines: Vec::new(),
             last_pos: (0, 0),
-            last_rgb: (0, 0, 0),
+            last_palette: None,
             light_theme: false,
         };
         o.refresh_theme();
@@ -102,6 +154,11 @@ impl Overlay {
     /// Forces a full redraw on the next `update`.
     pub fn invalidate(&mut self) {
         self.last_lines.clear();
+    }
+
+    /// Top-left of the meter while it is on screen, used to anchor the menu.
+    pub fn anchor(&self) -> Option<(i32, i32)> {
+        self.visible.then_some(self.last_pos)
     }
 
     pub fn refresh_theme(&mut self) {
@@ -120,7 +177,7 @@ impl Overlay {
         }
     }
 
-    pub fn update(&mut self, lines: &[String], settings: &Settings) {
+    pub fn update(&mut self, lines: &[Line], settings: &Settings) {
         let taskbar = if lines.is_empty() || fullscreen_app_active() {
             None
         } else {
@@ -150,21 +207,18 @@ impl Overlay {
         let right_edge = tb.tray_left.unwrap_or(tb.rect.right - scale(320));
         let x = (right_edge - width - scale(8) + scale(settings.offset_x)).max(tb.rect.left);
         let y = tb.rect.top + ((tb.rect.bottom - tb.rect.top) - height) / 2;
-        let rgb = match settings.color {
-            Color::White => (255, 255, 255),
-            Color::Black => (24, 24, 24),
-            Color::Auto if self.light_theme => (24, 24, 24),
-            Color::Auto => (255, 255, 255),
-        };
+        let palette = Palette::new(settings.color, self.light_theme);
 
-        let changed = self.last_lines != lines || self.last_pos != (x, y) || self.last_rgb != rgb;
+        let changed = self.last_lines != lines
+            || self.last_pos != (x, y)
+            || self.last_palette != Some(palette);
         if changed {
             if let Some(layout) = &self.layout {
-                draw(self.hwnd, layout, lines, rgb, x, y);
+                draw(self.hwnd, layout, lines, palette, x, y);
             }
             self.last_lines = lines.to_vec();
             self.last_pos = (x, y);
-            self.last_rgb = rgb;
+            self.last_palette = Some(palette);
         }
         if !self.visible {
             unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
@@ -187,7 +241,7 @@ impl Overlay {
 
 /// Renders the lines as white-on-black with grayscale antialiasing, then converts the
 /// coverage into per-pixel alpha so the text blends onto whatever the taskbar looks like.
-fn draw(hwnd: HWND, layout: &Layout, lines: &[String], rgb: (u8, u8, u8), x: i32, y: i32) {
+fn draw(hwnd: HWND, layout: &Layout, lines: &[Line], palette: Palette, x: i32, y: i32) {
     let (w, h) = (layout.width, layout.line_h * lines.len() as i32);
     if w <= 0 || h <= 0 {
         return;
@@ -210,40 +264,54 @@ fn draw(hwnd: HWND, layout: &Layout, lines: &[String], rgb: (u8, u8, u8), x: i32
             let old_font = SelectObject(mem, layout.font);
             SetBkMode(mem, 1); // TRANSPARENT
             SetTextColor(mem, 0x00FF_FFFF);
+            let flags = DT_NOPREFIX | DT_SINGLELINE | DT_NOCLIP;
             for (i, line) in lines.iter().enumerate() {
-                let text = wide(line);
-                let mut rect = RECT {
-                    left: 2,
-                    top: i as i32 * layout.line_h,
-                    right: w,
-                    bottom: (i as i32 + 1) * layout.line_h,
+                let top = i as i32 * layout.line_h;
+                let bottom = top + layout.line_h;
+
+                let arrow = wide(if line.down { "\u{2193}" } else { "\u{2191}" });
+                let mut r = RECT { left: PAD, top, right: PAD + layout.arrow_w, bottom };
+                DrawTextW(mem, arrow.as_ptr(), -1, &mut r, DT_LEFT | flags);
+
+                // Right-aligned so the units line up between the two rows.
+                let value = wide(&line.value);
+                let mut r = RECT {
+                    left: PAD + layout.arrow_w + layout.gap,
+                    top,
+                    right: w - PAD,
+                    bottom,
                 };
-                DrawTextW(
-                    mem,
-                    text.as_ptr(),
-                    -1,
-                    &mut rect,
-                    DT_LEFT | DT_NOPREFIX | DT_SINGLELINE | DT_NOCLIP,
-                );
+                DrawTextW(mem, value.as_ptr(), -1, &mut r, DT_RIGHT | flags);
             }
             GdiFlush();
 
-            let (r, g, b) = (rgb.0 as u32, rgb.1 as u32, rgb.2 as u32);
+            let arrow_end = PAD + layout.arrow_w + layout.gap / 2;
             let px = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
-            for p in px.iter_mut() {
+            for (i, p) in px.iter_mut().enumerate() {
                 let a = *p & 0xFF;
-                *p = if a == 0 {
-                    0
+                if a == 0 {
+                    *p = 0;
+                    continue;
+                }
+                let (col, row) = (i as i32 % w, (i as i32 / w / layout.line_h) as usize);
+                let (r, g, b) = if col < arrow_end {
+                    if lines.get(row).map_or(true, |l| l.down) {
+                        palette.down
+                    } else {
+                        palette.up
+                    }
                 } else {
-                    (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255)
+                    palette.text
                 };
+                let (r, g, b) = (r as u32, g as u32, b as u32);
+                *p = (a << 24) | ((r * a / 255) << 16) | ((g * a / 255) << 8) | (b * a / 255);
             }
 
             let dst = POINT { x, y };
             let src = POINT { x: 0, y: 0 };
             let size = SIZE { cx: w, cy: h };
             let blend = BLENDFUNCTION {
-                BlendOp: 0,   // AC_SRC_OVER
+                BlendOp: 0, // AC_SRC_OVER
                 BlendFlags: 0,
                 SourceConstantAlpha: 255,
                 AlphaFormat: 1, // AC_SRC_ALPHA
